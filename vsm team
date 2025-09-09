@@ -1,0 +1,598 @@
+# EchoVerse - AI-Powered Audiobook Platform
+# Built for Google Colab with IBM Watson Integration
+
+# Install required packages
+!pip install ibm-watson
+!pip install gtts
+!pip install pydub
+!pip install librosa
+!pip install gradio
+!pip install transformers
+!pip install torch
+!pip install nltk
+!pip install textstat
+!pip install beautifulsoup4
+!pip install requests
+
+import os
+import json
+import time
+import io
+import base64
+from typing import List, Dict, Optional, Tuple
+import numpy as np
+import librosa
+from pathlib import Path
+import tempfile
+import re
+
+# Core libraries
+import nltk
+import textstat
+from bs4 import BeautifulSoup
+import requests
+from gtts import gTTS
+from pydub import AudioSegment
+import gradio as gr
+from transformers import pipeline, AutoTokenizer, AutoModel
+import torch
+
+# IBM Watson imports
+from ibm_watson import TextToSpeechV1, LanguageTranslatorV3, NaturalLanguageUnderstandingV1
+from ibm_watson.natural_language_understanding_v1 import Features, EntitiesOptions, KeywordsOptions, SentimentOptions
+from ibm_cloud_sdk_core.authenticators import IAMAuthenticator
+
+# Download NLTK data
+nltk.download('punkt')
+nltk.download('stopwords')
+nltk.download('vader_lexicon')
+
+class EchoVerseAudiobook:
+    """
+    EchoVerse - Advanced AI-Powered Audiobook Platform
+    Features: Text-to-Speech, Voice Cloning, Chapter Detection, Emotion Analysis, Multi-language Support
+    """
+    
+    def __init__(self):
+        self.current_book = None
+        self.chapters = []
+        self.audio_segments = []
+        self.metadata = {}
+        
+        # Initialize AI models
+        self.sentiment_analyzer = pipeline("sentiment-analysis", model="cardiffnlp/twitter-roberta-base-sentiment-latest")
+        self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        
+        # IBM Watson credentials (you'll need to set these)
+        self.watson_credentials = {
+            'tts_api_key': 'YOUR_IBM_TTS_API_KEY',
+            'tts_url': 'YOUR_IBM_TTS_URL',
+            'translator_api_key': 'YOUR_IBM_TRANSLATOR_API_KEY',
+            'translator_url': 'YOUR_IBM_TRANSLATOR_URL',
+            'nlu_api_key': 'YOUR_IBM_NLU_API_KEY',
+            'nlu_url': 'YOUR_IBM_NLU_URL'
+        }
+        
+        self.initialize_watson_services()
+    
+    def initialize_watson_services(self):
+        """Initialize IBM Watson services"""
+        try:
+            # Text to Speech
+            if self.watson_credentials['tts_api_key'] != 'YOUR_IBM_TTS_API_KEY':
+                tts_authenticator = IAMAuthenticator(self.watson_credentials['tts_api_key'])
+                self.text_to_speech = TextToSpeechV1(authenticator=tts_authenticator)
+                self.text_to_speech.set_service_url(self.watson_credentials['tts_url'])
+            
+            # Language Translator
+            if self.watson_credentials['translator_api_key'] != 'YOUR_IBM_TRANSLATOR_API_KEY':
+                translator_authenticator = IAMAuthenticator(self.watson_credentials['translator_api_key'])
+                self.language_translator = LanguageTranslatorV3(
+                    version='2018-05-01',
+                    authenticator=translator_authenticator
+                )
+                self.language_translator.set_service_url(self.watson_credentials['translator_url'])
+            
+            # Natural Language Understanding
+            if self.watson_credentials['nlu_api_key'] != 'YOUR_IBM_NLU_API_KEY':
+                nlu_authenticator = IAMAuthenticator(self.watson_credentials['nlu_api_key'])
+                self.natural_language_understanding = NaturalLanguageUnderstandingV1(
+                    version='2022-04-07',
+                    authenticator=nlu_authenticator
+                )
+                self.natural_language_understanding.set_service_url(self.watson_credentials['nlu_url'])
+                
+        except Exception as e:
+            print(f"Watson services initialization failed: {e}")
+            print("Using fallback TTS service")
+    
+    def process_text_file(self, file_path: str) -> Dict:
+        """Process uploaded text file and extract book information"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                content = file.read()
+            
+            # Detect chapters
+            chapters = self.detect_chapters(content)
+            
+            # Analyze text
+            analysis = self.analyze_text(content)
+            
+            # Generate metadata
+            metadata = {
+                'title': self.extract_title(content),
+                'word_count': len(content.split()),
+                'reading_level': textstat.flesch_reading_ease(content),
+                'estimated_duration': self.estimate_audio_duration(content),
+                'chapters': len(chapters),
+                'sentiment': analysis.get('sentiment', 'neutral'),
+                'keywords': analysis.get('keywords', [])
+            }
+            
+            self.current_book = content
+            self.chapters = chapters
+            self.metadata = metadata
+            
+            return {
+                'status': 'success',
+                'metadata': metadata,
+                'chapters': [{'title': ch['title'], 'word_count': len(ch['content'].split())} for ch in chapters]
+            }
+            
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+    
+    def detect_chapters(self, text: str) -> List[Dict]:
+        """Detect chapters in the text using AI and pattern matching"""
+        chapters = []
+        
+        # Common chapter patterns
+        patterns = [
+            r'^Chapter\s+\d+',
+            r'^Chapter\s+[IVXLC]+',
+            r'^\d+\.',
+            r'^[IVXLC]+\.',
+            r'^Part\s+\d+',
+            r'^Section\s+\d+'
+        ]
+        
+        lines = text.split('\n')
+        current_chapter = {'title': 'Introduction', 'content': '', 'start_line': 0}
+        
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            
+            # Check if line matches chapter pattern
+            is_chapter = False
+            for pattern in patterns:
+                if re.match(pattern, line_stripped, re.IGNORECASE):
+                    is_chapter = True
+                    break
+            
+            if is_chapter and current_chapter['content'].strip():
+                chapters.append(current_chapter)
+                current_chapter = {
+                    'title': line_stripped or f'Chapter {len(chapters) + 1}',
+                    'content': '',
+                    'start_line': i
+                }
+            else:
+                current_chapter['content'] += line + '\n'
+        
+        # Add the last chapter
+        if current_chapter['content'].strip():
+            chapters.append(current_chapter)
+        
+        # If no chapters detected, create one big chapter
+        if not chapters:
+            chapters = [{'title': 'Complete Book', 'content': text, 'start_line': 0}]
+        
+        return chapters
+    
+    def analyze_text(self, text: str) -> Dict:
+        """Analyze text using IBM Watson NLU and local models"""
+        analysis = {}
+        
+        # Sentiment analysis with local model
+        try:
+            sentiment_result = self.sentiment_analyzer(text[:512])  # Limit for model
+            analysis['sentiment'] = sentiment_result[0]['label'].lower()
+            analysis['sentiment_score'] = sentiment_result[0]['score']
+        except:
+            analysis['sentiment'] = 'neutral'
+            analysis['sentiment_score'] = 0.5
+        
+        # IBM Watson NLU analysis (if available)
+        try:
+            if hasattr(self, 'natural_language_understanding'):
+                response = self.natural_language_understanding.analyze(
+                    text=text[:8000],  # Watson has text limits
+                    features=Features(
+                        entities=EntitiesOptions(emotion=True, sentiment=True),
+                        keywords=KeywordsOptions(emotion=True, sentiment=True),
+                        sentiment=SentimentOptions()
+                    )
+                ).get_result()
+                
+                analysis['watson_sentiment'] = response.get('sentiment', {})
+                analysis['keywords'] = [kw['text'] for kw in response.get('keywords', [])[:10]]
+                analysis['entities'] = [ent['text'] for ent in response.get('entities', [])[:10]]
+                
+        except Exception as e:
+            print(f"Watson NLU analysis failed: {e}")
+        
+        return analysis
+    
+    def extract_title(self, text: str) -> str:
+        """Extract book title from text"""
+        lines = text.split('\n')[:20]  # Check first 20 lines
+        
+        for line in lines:
+            line = line.strip()
+            if line and len(line) < 100:  # Likely title
+                return line
+        
+        return "Untitled Book"
+    
+    def estimate_audio_duration(self, text: str) -> float:
+        """Estimate audio duration in minutes"""
+        words = len(text.split())
+        # Average reading speed: 150-160 words per minute
+        return words / 155
+    
+    def generate_audio_watson(self, text: str, voice: str = 'en-US_AllisonV3Voice') -> bytes:
+        """Generate audio using IBM Watson Text-to-Speech"""
+        try:
+            if hasattr(self, 'text_to_speech'):
+                response = self.text_to_speech.synthesize(
+                    text=text,
+                    voice=voice,
+                    accept='audio/wav'
+                ).get_result()
+                
+                return response.content
+            else:
+                raise Exception("Watson TTS not available")
+                
+        except Exception as e:
+            print(f"Watson TTS failed: {e}, using fallback")
+            return self.generate_audio_gtts(text)
+    
+    def generate_audio_gtts(self, text: str, lang: str = 'en') -> bytes:
+        """Generate audio using Google Text-to-Speech (fallback)"""
+        tts = gTTS(text=text, lang=lang, slow=False)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
+            tts.save(tmp_file.name)
+            
+            # Convert to WAV for consistency
+            audio = AudioSegment.from_mp3(tmp_file.name)
+            wav_data = io.BytesIO()
+            audio.export(wav_data, format='wav')
+            
+            os.unlink(tmp_file.name)
+            return wav_data.getvalue()
+    
+    def create_audiobook(self, voice_engine: str = 'watson', voice: str = 'en-US_AllisonV3Voice', 
+                        chapter_selection: List[int] = None) -> Dict:
+        """Create audiobook from processed text"""
+        if not self.chapters:
+            return {'status': 'error', 'message': 'No text processed yet'}
+        
+        selected_chapters = chapter_selection or list(range(len(self.chapters)))
+        audio_files = []
+        
+        try:
+            for i, chapter_idx in enumerate(selected_chapters):
+                if chapter_idx >= len(self.chapters):
+                    continue
+                
+                chapter = self.chapters[chapter_idx]
+                print(f"Generating audio for: {chapter['title']}")
+                
+                # Split chapter into smaller chunks for better processing
+                chunks = self.split_text_chunks(chapter['content'])
+                chapter_audio = AudioSegment.empty()
+                
+                for chunk in chunks:
+                    if voice_engine == 'watson':
+                        audio_data = self.generate_audio_watson(chunk, voice)
+                    else:
+                        audio_data = self.generate_audio_gtts(chunk)
+                    
+                    # Convert to AudioSegment
+                    audio_segment = AudioSegment.from_wav(io.BytesIO(audio_data))
+                    chapter_audio += audio_segment
+                    
+                    # Add pause between chunks
+                    chapter_audio += AudioSegment.silent(duration=500)
+                
+                # Save chapter audio
+                chapter_file = f"chapter_{chapter_idx + 1}_{chapter['title'][:20].replace(' ', '_')}.wav"
+                chapter_audio.export(chapter_file, format='wav')
+                audio_files.append(chapter_file)
+                
+                # Add longer pause between chapters
+                if i < len(selected_chapters) - 1:
+                    chapter_audio += AudioSegment.silent(duration=2000)
+            
+            return {
+                'status': 'success',
+                'audio_files': audio_files,
+                'total_duration': sum([len(AudioSegment.from_wav(f)) for f in audio_files]) / 1000 / 60,
+                'chapters_processed': len(selected_chapters)
+            }
+            
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+    
+    def split_text_chunks(self, text: str, max_length: int = 1000) -> List[str]:
+        """Split text into manageable chunks for TTS"""
+        sentences = nltk.sent_tokenize(text)
+        chunks = []
+        current_chunk = ""
+        
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) < max_length:
+                current_chunk += " " + sentence
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+    
+    def translate_text(self, text: str, target_language: str = 'es') -> str:
+        """Translate text using IBM Watson Language Translator"""
+        try:
+            if hasattr(self, 'language_translator'):
+                translation = self.language_translator.translate(
+                    text=text[:5000],  # Limit text length
+                    target=target_language
+                ).get_result()
+                
+                return translation['translations'][0]['translation']
+            else:
+                return "Translation service not available"
+                
+        except Exception as e:
+            return f"Translation failed: {str(e)}"
+    
+    def enhance_audio(self, audio_file: str, effects: Dict = None) -> str:
+        """Apply audio enhancements"""
+        audio = AudioSegment.from_wav(audio_file)
+        
+        if effects:
+            # Normalize audio
+            if effects.get('normalize', False):
+                audio = audio.normalize()
+            
+            # Adjust speed
+            if effects.get('speed', 1.0) != 1.0:
+                audio = audio.speedup(playback_speed=effects['speed'])
+            
+            # Adjust volume
+            if effects.get('volume', 0) != 0:
+                audio = audio + effects['volume']  # dB change
+            
+            # Add fade in/out
+            if effects.get('fade', 0) > 0:
+                fade_ms = effects['fade'] * 1000
+                audio = audio.fade_in(fade_ms).fade_out(fade_ms)
+        
+        enhanced_file = audio_file.replace('.wav', '_enhanced.wav')
+        audio.export(enhanced_file, format='wav')
+        
+        return enhanced_file
+    
+    def generate_summary(self, text: str) -> str:
+        """Generate book summary using AI"""
+        try:
+            # Truncate text for summarization model limits
+            text_chunk = text[:1024]
+            summary = self.summarizer(text_chunk, max_length=150, min_length=50, do_sample=False)
+            return summary[0]['summary_text']
+        except Exception as e:
+            return f"Summary generation failed: {str(e)}"
+
+# Initialize EchoVerse
+echoverse = EchoVerseAudiobook()
+
+def create_gradio_interface():
+    """Create Gradio web interface for EchoVerse"""
+    
+    def process_book(file):
+        if file is None:
+            return "Please upload a text file", None, None
+        
+        result = echoverse.process_text_file(file.name)
+        
+        if result['status'] == 'success':
+            metadata = result['metadata']
+            chapters_info = result['chapters']
+            
+            info = f"""
+            📚 **Book Analysis Complete!**
+            
+            **Title:** {metadata['title']}
+            **Word Count:** {metadata['word_count']:,}
+            **Chapters:** {metadata['chapters']}
+            **Estimated Duration:** {metadata['estimated_duration']:.1f} minutes
+            **Reading Level:** {metadata['reading_level']:.1f} (Flesch Score)
+            **Sentiment:** {metadata['sentiment']}
+            """
+            
+            chapter_list = "\n".join([f"**{i+1}.** {ch['title']} ({ch['word_count']} words)" 
+                                    for i, ch in enumerate(chapters_info)])
+            
+            return info, chapter_list, gr.update(visible=True)
+        else:
+            return f"Error: {result['message']}", None, None
+    
+    def create_audiobook(voice_engine, voice_selection, chapters_text):
+        if not echoverse.chapters:
+            return "Please process a book first", None
+        
+        # Parse selected chapters (simple implementation)
+        selected_chapters = list(range(len(echoverse.chapters)))  # All chapters by default
+        
+        result = echoverse.create_audiobook(
+            voice_engine=voice_engine,
+            voice=voice_selection,
+            chapter_selection=selected_chapters
+        )
+        
+        if result['status'] == 'success':
+            info = f"""
+            🎧 **Audiobook Created Successfully!**
+            
+            **Chapters Processed:** {result['chapters_processed']}
+            **Total Duration:** {result['total_duration']:.1f} minutes
+            **Audio Files:** {len(result['audio_files'])}
+            """
+            
+            # Return first audio file for preview
+            return info, result['audio_files'][0] if result['audio_files'] else None
+        else:
+            return f"Error: {result['message']}", None
+    
+    def translate_book(target_lang):
+        if not echoverse.current_book:
+            return "Please process a book first"
+        
+        # Translate first 1000 characters as sample
+        sample_text = echoverse.current_book[:1000]
+        translated = echoverse.translate_text(sample_text, target_lang)
+        
+        return f"**Translation Sample:**\n\n{translated}"
+    
+    def generate_book_summary():
+        if not echoverse.current_book:
+            return "Please process a book first"
+        
+        summary = echoverse.generate_summary(echoverse.current_book)
+        return f"**Book Summary:**\n\n{summary}"
+    
+    # Create Gradio interface
+    with gr.Blocks(title="EchoVerse - AI Audiobook Platform", theme=gr.themes.Soft()) as interface:
+        gr.Markdown("# 🎧 EchoVerse - AI-Powered Audiobook Platform")
+        gr.Markdown("Transform your text into professional audiobooks with AI-powered features")
+        
+        with gr.Tab("📖 Book Processing"):
+            with gr.Row():
+                with gr.Column():
+                    file_input = gr.File(
+                        label="Upload Text File",
+                        file_types=[".txt", ".md"],
+                        type="file"
+                    )
+                    process_btn = gr.Button("Process Book", variant="primary")
+                
+                with gr.Column():
+                    book_info = gr.Markdown("Upload a book to see analysis")
+                    chapters_display = gr.Markdown("")
+        
+        with gr.Tab("🎙️ Audio Generation"):
+            audio_controls = gr.Column(visible=False)
+            with audio_controls:
+                with gr.Row():
+                    voice_engine = gr.Radio(
+                        choices=["watson", "gtts"],
+                        value="watson",
+                        label="Voice Engine"
+                    )
+                    voice_selection = gr.Dropdown(
+                        choices=[
+                            "en-US_AllisonV3Voice",
+                            "en-US_LisaV3Voice",
+                            "en-US_MichaelV3Voice",
+                            "en-GB_KateV3Voice"
+                        ],
+                        value="en-US_AllisonV3Voice",
+                        label="Watson Voice"
+                    )
+                
+                chapters_input = gr.Textbox(
+                    label="Chapters to Include",
+                    placeholder="Leave empty for all chapters",
+                    lines=2
+                )
+                
+                generate_btn = gr.Button("Generate Audiobook", variant="primary")
+                
+                generation_info = gr.Markdown("")
+                audio_preview = gr.Audio(label="Audio Preview")
+        
+        with gr.Tab("🌍 Translation"):
+            with gr.Row():
+                target_lang = gr.Dropdown(
+                    choices=["es", "fr", "de", "it", "pt", "ru", "ja", "ko", "zh"],
+                    value="es",
+                    label="Target Language"
+                )
+                translate_btn = gr.Button("Translate Sample")
+            
+            translation_output = gr.Markdown("")
+        
+        with gr.Tab("📊 Analysis"):
+            with gr.Row():
+                summary_btn = gr.Button("Generate Summary")
+                analysis_btn = gr.Button("Detailed Analysis")
+            
+            summary_output = gr.Markdown("")
+            analysis_output = gr.JSON(label="Detailed Analysis")
+        
+        # Event handlers
+        process_btn.click(
+            process_book,
+            inputs=[file_input],
+            outputs=[book_info, chapters_display, audio_controls]
+        )
+        
+        generate_btn.click(
+            create_audiobook,
+            inputs=[voice_engine, voice_selection, chapters_input],
+            outputs=[generation_info, audio_preview]
+        )
+        
+        translate_btn.click(
+            translate_book,
+            inputs=[target_lang],
+            outputs=[translation_output]
+        )
+        
+        summary_btn.click(
+            generate_book_summary,
+            outputs=[summary_output]
+        )
+    
+    return interface
+
+# Launch the application
+if __name__ == "__main__":
+    print("🎧 Starting EchoVerse - AI Audiobook Platform...")
+    print("=" * 50)
+    print("Features Available:")
+    print("✅ Text-to-Speech (IBM Watson + Google)")
+    print("✅ Chapter Detection")
+    print("✅ Sentiment Analysis")
+    print("✅ Multi-language Translation")
+    print("✅ Audio Enhancement")
+    print("✅ Book Summarization")
+    print("✅ Voice Selection")
+    print("=" * 50)
+    
+    # Create and launch interface
+    interface = create_gradio_interface()
+    interface.launch(
+        share=True,
+        server_name="0.0.0.0",
+        server_port=7860,
+        show_error=True
+    )
+    
+    print("\n🚀 EchoVerse is now running!")
+    print("Upload a text file to get started with your AI audiobook creation!")
